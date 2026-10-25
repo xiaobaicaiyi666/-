@@ -18,23 +18,22 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'          # 自动缓存 Gradle
 
       - name: 3. Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
-      - name: 4. Grant execute permission for gradlew
-        run: chmod +x ./gradlew
+      - name: 4. Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
 
-      - name: 5. Create local.properties (保险)
-        run: |
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
-          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+      - name: 5. Create local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
 
       - name: 6. Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace --no-daemon
+        run: gradle assembleDebug --stacktrace --no-daemon
 
       - name: 7. Upload APK
         uses: actions/upload-artifact@v4
