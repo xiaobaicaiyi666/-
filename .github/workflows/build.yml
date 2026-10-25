@@ -19,8 +19,10 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 3. 配置 Android SDK
-        uses: android-actions/setup-android@v3
+      - name: 3. 配置 Android SDK 环境变量
+        run: |
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          mkdir -p $HOME/android-sdk
 
       - name: 4. 自动安装 Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
