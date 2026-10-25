@@ -1,0 +1,37 @@
+name: Build SaltLite APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 检出仓库源码
+        uses: actions/checkout@v4
+
+      - name: 2. 配置 JDK 17 环境
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 3. 配置 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 4. 自动安装 Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: 5. 编译 Debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: 6. 上传生成的 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: SaltLitePlayer-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
