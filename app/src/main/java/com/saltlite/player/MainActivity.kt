@@ -1,0 +1,1568 @@
+package com.saltlite.player
+
+import android.Manifest
+import android.app.PendingIntent
+import android.content.ComponentName
+import android.content.ContentUris
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.snapshots.SnapshotStateList
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.MediaController
+import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionToken
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import java.io.BufferedReader
+import java.io.File
+import java.io.InputStreamReader
+import java.util.Locale
+import java.util.UUID
+
+// ==================== 1. 后台锁屏播放与媒体通知栏服务 ====================
+
+class PlaybackService : MediaSessionService() {
+    private var mediaSession: MediaSession? = null
+
+    override fun onCreate() {
+        super.onCreate()
+
+        val audioAttributes = AudioAttributes.Builder()
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .setUsage(C.USAGE_MEDIA)
+            .build()
+
+        val exoPlayer = ExoPlayer.Builder(this)
+            .setAudioAttributes(audioAttributes, true)
+            .setHandleAudioBecomingNoisy(true)
+            .setWakeMode(C.WAKE_MODE_LOCAL)
+            .build().apply {
+                repeatMode = Player.REPEAT_MODE_ALL
+            }
+
+        val intent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        mediaSession = MediaSession.Builder(this, exoPlayer)
+            .setSessionActivity(pendingIntent)
+            .build()
+    }
+
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
+        return mediaSession
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val player = mediaSession?.player
+        if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
+            stopSelf()
+        }
+    }
+
+    override fun onDestroy() {
+        mediaSession?.run {
+            player.release()
+            release()
+            mediaSession = null
+        }
+        super.onDestroy()
+    }
+}
+
+// ==================== 2. 数据模型与播放模式枚举 ====================
+
+enum class PlayMode(val label: String, val icon: ImageVector) {
+    REPEAT_ALL("列表循环", Icons.Default.Repeat),
+    REPEAT_ONE("单曲循环", Icons.Default.RepeatOne),
+    SHUFFLE("随机播放", Icons.Default.Shuffle)
+}
+
+data class SongTrack(
+    val queueEntryId: String = UUID.randomUUID().toString(),
+    val title: String,
+    val artist: String,
+    val uri: Uri,
+    val folderName: String,
+    val filePath: String = ""
+) {
+    fun toMediaItem(): MediaItem {
+        val metadata = MediaMetadata.Builder()
+            .setTitle(title)
+            .setArtist(artist)
+            .setAlbumTitle(folderName)
+            .build()
+        return MediaItem.Builder()
+            .setMediaId(queueEntryId)
+            .setUri(uri)
+            .setMediaMetadata(metadata)
+            .build()
+    }
+}
+
+data class PlayQueueSession(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val songs: SnapshotStateList<SongTrack> = mutableStateListOf()
+)
+
+data class LrcLine(
+    val timeMs: Long,
+    val text: String
+)
+
+// ==================== 3. LRC 歌词解析与内嵌封面提取工具 ====================
+
+object MediaExtraHelper {
+    private val TIME_REGEX = Regex("""\[(\d{2}):(\d{2})\.(\d{2,3})]""")
+
+    /**
+     * 解析标准 LRC 文本内容为按时间排序的歌词行列表
+     */
+    fun parseLrcText(rawText: String): List<LrcLine> {
+        val result = mutableListOf<LrcLine>()
+        rawText.lines().forEach { line ->
+            val matches = TIME_REGEX.findAll(line).toList()
+            if (matches.isNotEmpty()) {
+                val content = line.replace(TIME_REGEX, "").trim()
+                if (content.isNotEmpty()) {
+                    for (match in matches) {
+                        val min = match.groupValues[1].toLongOrNull() ?: 0L
+                        val sec = match.groupValues[2].toLongOrNull() ?: 0L
+                        val msStr = match.groupValues[3]
+                        val ms = if (msStr.length == 2) {
+                            (msStr.toLongOrNull() ?: 0L) * 10L
+                        } else {
+                            msStr.toLongOrNull() ?: 0L
+                        }
+                        val totalMs = min * 60_000L + sec * 1_000L + ms
+                        result.add(LrcLine(timeMs = totalMs, text = content))
+                    }
+                }
+            }
+        }
+        return result.sortedBy { it.timeMs }
+    }
+
+    /**
+     * 尝试自动读取歌曲同目录下的同名 .lrc 歌词文件
+     */
+    fun loadAutoLrcForSong(song: SongTrack): List<LrcLine> {
+        if (song.filePath.isNotBlank()) {
+            try {
+                val lrcPath = song.filePath.substringBeforeLast(".") + ".lrc"
+                val lrcFile = File(lrcPath)
+                if (lrcFile.exists() && lrcFile.canRead()) {
+                    return parseLrcText(lrcFile.readText())
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return emptyList()
+    }
+
+    /**
+     * 从用户手动选择的 Uri 读取 .lrc 歌词文件
+     */
+    fun loadLrcFromUri(context: Context, uri: Uri): List<LrcLine> {
+        return try {
+            val sb = StringBuilder()
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                BufferedReader(InputStreamReader(input)).use { reader ->
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        sb.appendLine(line)
+                    }
+                }
+            }
+            parseLrcText(sb.toString())
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * 提取音频文件内嵌的专辑封面 Bitmap
+     */
+    fun extractEmbeddedAlbumArt(context: Context, uri: Uri): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            val bytes = retriever.embeddedPicture
+            if (bytes != null) {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            null
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * 格式化毫秒为 mm:ss
+     */
+    fun formatTime(ms: Long): String {
+        val totalSeconds = (ms.coerceAtLeast(0L)) / 1000L
+        val minutes = totalSeconds / 60L
+        val seconds = totalSeconds % 60L
+        return String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+    }
+}
+
+// ==================== 4. 多播放列表全局控制器 ====================
+
+class SaltMultiQueueController private constructor(private val appContext: Context) {
+
+    companion object {
+        @Volatile
+        private var instance: SaltMultiQueueController? = null
+
+        fun getInstance(context: Context): SaltMultiQueueController {
+            return instance ?: synchronized(this) {
+                instance ?: SaltMultiQueueController(context.applicationContext).also {
+                    instance = it
+                }
+            }
+        }
+    }
+
+    var player: Player? by mutableStateOf(null)
+        private set
+
+    val queues = mutableStateListOf<PlayQueueSession>()
+    var viewingQueueId by mutableStateOf<String?>(null)
+    var playingQueueId by mutableStateOf<String?>(null)
+
+    var isPlaying by mutableStateOf(false)
+    var currentSong by mutableStateOf<SongTrack?>(null)
+    var currentPosition by mutableLongStateOf(0L)
+    var duration by mutableLongStateOf(0L)
+
+    // 当前播放模式（列表循环 / 单曲循环 / 随机播放）
+    var playMode by mutableStateOf(PlayMode.REPEAT_ALL)
+        private set
+
+    // 存储手动导入绑定的歌词（Key 为歌曲标题）
+    val manualLyricsMap = mutableStateMapOf<String, List<LrcLine>>()
+
+    private var queueCounter = 1
+
+    init {
+        connectToService()
+    }
+
+    private fun connectToService() {
+        val sessionToken = SessionToken(
+            appContext,
+            ComponentName(appContext, PlaybackService::class.java)
+        )
+        val controllerFuture = MediaController.Builder(appContext, sessionToken).buildAsync()
+        controllerFuture.addListener({
+            try {
+                val controller = controllerFuture.get()
+                player = controller
+                applyPlayModeToPlayer(controller, playMode)
+                setupPlayerListener(controller)
+                isPlaying = controller.isPlaying
+                updateCurrentSongState(controller.currentMediaItem)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }, ContextCompat.getMainExecutor(appContext))
+    }
+
+    private fun setupPlayerListener(controller: Player) {
+        controller.addListener(object : Player.Listener {
+            override fun onIsPlayingChanged(playing: Boolean) {
+                isPlaying = playing
+            }
+
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                updateCurrentSongState(mediaItem)
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                duration = controller.duration.coerceAtLeast(0L)
+                updateCurrentSongState(controller.currentMediaItem)
+            }
+        })
+    }
+
+    private fun updateCurrentSongState(mediaItem: MediaItem?) {
+        val activeQueue = queues.find { it.id == playingQueueId }
+        currentSong = activeQueue?.songs?.find { it.queueEntryId == mediaItem?.mediaId }
+        duration = (player?.duration ?: 0L).coerceAtLeast(0L)
+    }
+
+    /**
+     * 切换播放模式：列表循环 -> 单曲循环 -> 随机播放
+     */
+    fun togglePlayMode() {
+        val nextMode = when (playMode) {
+            PlayMode.REPEAT_ALL -> PlayMode.REPEAT_ONE
+            PlayMode.REPEAT_ONE -> PlayMode.SHUFFLE
+            PlayMode.SHUFFLE -> PlayMode.REPEAT_ALL
+        }
+        playMode = nextMode
+        player?.let { applyPlayModeToPlayer(it, nextMode) }
+        Toast.makeText(appContext, "已切换为：${nextMode.label}", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun applyPlayModeToPlayer(p: Player, mode: PlayMode) {
+        when (mode) {
+            PlayMode.REPEAT_ALL -> {
+                p.repeatMode = Player.REPEAT_MODE_ALL
+                p.shuffleModeEnabled = false
+            }
+            PlayMode.REPEAT_ONE -> {
+                p.repeatMode = Player.REPEAT_MODE_ONE
+                p.shuffleModeEnabled = false
+            }
+            PlayMode.SHUFFLE -> {
+                p.repeatMode = Player.REPEAT_MODE_ALL
+                p.shuffleModeEnabled = true
+            }
+        }
+    }
+
+    fun createPlaylistFromFiles(sourceName: String, tracks: List<SongTrack>, autoPlay: Boolean = false) {
+        if (tracks.isEmpty()) return
+        val copiedTracks = tracks.map { it.copy(queueEntryId = UUID.randomUUID().toString()) }
+        val newSession = PlayQueueSession(
+            name = "列表${queueCounter++}: $sourceName",
+            songs = mutableStateListOf<SongTrack>().apply { addAll(copiedTracks) }
+        )
+        queues.add(newSession)
+        viewingQueueId = newSession.id
+
+        val activePlayer = player
+        if (autoPlay || (playingQueueId == null && activePlayer?.isPlaying != true)) {
+            playSongInQueue(newSession.id, 0)
+        } else {
+            Toast.makeText(appContext, "已生成「${newSession.name}」，当前播放不受影响", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun switchViewingQueue(queueId: String) {
+        viewingQueueId = queueId
+    }
+
+    fun playSongInQueue(queueId: String, index: Int) {
+        val activePlayer = player ?: return
+        val targetQueue = queues.find { it.id == queueId } ?: return
+        if (index !in targetQueue.songs.indices) return
+
+        viewingQueueId = queueId
+        if (playingQueueId != queueId) {
+            playingQueueId = queueId
+            val mediaItems = targetQueue.songs.map { it.toMediaItem() }
+            activePlayer.setMediaItems(mediaItems, index, 0L)
+            activePlayer.prepare()
+            activePlayer.play()
+        } else {
+            activePlayer.seekTo(index, 0L)
+            activePlayer.play()
+        }
+        currentSong = targetQueue.songs[index]
+    }
+
+    fun playNext(targetTrack: SongTrack, fromQueueId: String) {
+        val activePlayer = player ?: return
+        val activeQueue = queues.find { it.id == playingQueueId }
+
+        if (activeQueue == null || activePlayer.mediaItemCount == 0) {
+            val sourceQueue = queues.find { it.id == fromQueueId } ?: return
+            val idx = sourceQueue.songs.indexOfFirst { it.queueEntryId == targetTrack.queueEntryId }
+            if (idx != -1) playSongInQueue(fromQueueId, idx)
+            return
+        }
+
+        val currentIndex = activePlayer.currentMediaItemIndex
+
+        if (fromQueueId == playingQueueId) {
+            val fromIndex = activeQueue.songs.indexOfFirst { it.queueEntryId == targetTrack.queueEntryId }
+            if (fromIndex == -1) return
+            if (fromIndex == currentIndex) {
+                Toast.makeText(appContext, "该歌曲正在播放中", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val insertIndex = if (fromIndex > currentIndex) currentIndex + 1 else currentIndex
+            val movedItem = activeQueue.songs.removeAt(fromIndex)
+            activeQueue.songs.add(insertIndex, movedItem)
+            activePlayer.moveMediaItem(fromIndex, insertIndex)
+            Toast.makeText(appContext, "已设为下一首播放：${targetTrack.title}", Toast.LENGTH_SHORT).show()
+        } else {
+            val newEntry = targetTrack.copy(queueEntryId = UUID.randomUUID().toString())
+            val insertIndex = (currentIndex + 1).coerceAtMost(activeQueue.songs.size)
+            activeQueue.songs.add(insertIndex, newEntry)
+            activePlayer.addMediaItem(insertIndex, newEntry.toMediaItem())
+            Toast.makeText(
+                appContext,
+                "已跨列表插入到「${activeQueue.name}」下一首播放",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    fun removeSongFromQueue(queueId: String, index: Int) {
+        val activePlayer = player
+        val targetQueue = queues.find { it.id == queueId } ?: return
+        if (index !in targetQueue.songs.indices) return
+
+        val removed = targetQueue.songs.removeAt(index)
+        if (queueId == playingQueueId && activePlayer != null && index < activePlayer.mediaItemCount) {
+            activePlayer.removeMediaItem(index)
+            updateCurrentSongState(activePlayer.currentMediaItem)
+        }
+        Toast.makeText(appContext, "已移除：${removed.title}", Toast.LENGTH_SHORT).show()
+    }
+
+    fun closeQueueTab(queueId: String) {
+        val index = queues.indexOfFirst { it.id == queueId }
+        if (index == -1) return
+        queues.removeAt(index)
+
+        if (viewingQueueId == queueId) {
+            viewingQueueId = queues.firstOrNull()?.id
+        }
+        if (playingQueueId == queueId) {
+            player?.stop()
+            player?.clearMediaItems()
+            playingQueueId = null
+            currentSong = null
+        }
+    }
+}
+
+// ==================== 5. 本地音频扫描工具 ====================
+
+object LocalAudioScanner {
+    fun scanAudioByFolders(context: Context): Map<String, List<SongTrack>> {
+        val songList = mutableListOf<SongTrack>()
+        val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(
+            MediaStore.Audio.Media._ID,
+            MediaStore.Audio.Media.TITLE,
+            MediaStore.Audio.Media.ARTIST,
+            MediaStore.Audio.Media.DATA
+        )
+        val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0"
+
+        try {
+            context.contentResolver.query(
+                collection,
+                projection,
+                selection,
+                null,
+                "${MediaStore.Audio.Media.DATE_ADDED} DESC"
+            )?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+                val titleCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
+                val artistCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
+                val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
+
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idCol)
+                    val title = cursor.getString(titleCol) ?: "未知曲目"
+                    val artist = cursor.getString(artistCol)?.takeIf { it != "<unknown>" } ?: "未知艺术家"
+                    val path = cursor.getString(dataCol) ?: ""
+                    val folderName = File(path).parentFile?.name ?: "默认目录"
+                    val contentUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
+
+                    songList.add(
+                        SongTrack(
+                            title = title,
+                            artist = artist,
+                            uri = contentUri,
+                            folderName = folderName,
+                            filePath = path
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return songList.groupBy { it.folderName }
+    }
+
+    fun parseSelectedUris(context: Context, uris: List<Uri>): List<SongTrack> {
+        return uris.mapIndexed { idx, uri ->
+            var displayName = "自选音频 ${idx + 1}"
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIndex != -1) {
+                        displayName = cursor.getString(nameIndex).substringBeforeLast(".")
+                    }
+                }
+            }
+            SongTrack(
+                title = displayName,
+                artist = "本地文件导入",
+                uri = uri,
+                folderName = "自选文件集"
+            )
+        }
+    }
+}
+
+// ==================== 6. Activity 与椒盐风格 Compose UI ====================
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val controller = SaltMultiQueueController.getInstance(applicationContext)
+
+        setContent {
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    primary = Color(0xFF64B5F6),
+                    surface = Color(0xFF181A20),
+                    background = Color(0xFF111318),
+                    surfaceVariant = Color(0xFF23262F)
+                )
+            ) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    SaltPlayerMainScreen(controller)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SaltPlayerMainScreen(controller: SaltMultiQueueController) {
+    val context = LocalContext.current
+    var folderGroups by remember { mutableStateOf<Map<String, List<SongTrack>>>(emptyMap()) }
+    var currentMainTab by remember { mutableIntStateOf(0) }
+    var showFullPlayer by remember { mutableStateOf(false) }
+
+    // 实时高频同步播放进度（200ms 刷新一次以保证歌词滚动丝滑）
+    LaunchedEffect(controller.isPlaying, controller.player) {
+        while (controller.isPlaying) {
+            val p = controller.player
+            if (p != null) {
+                controller.currentPosition = p.currentPosition.coerceAtLeast(0L)
+                controller.duration = p.duration.coerceAtLeast(0L)
+            }
+            delay(200L)
+        }
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            folderGroups = LocalAudioScanner.scanAudioByFolders(context)
+        }
+    }
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            val tracks = LocalAudioScanner.parseSelectedUris(context, uris)
+            controller.createPlaylistFromFiles("自选文件(${tracks.size}首)", tracks, autoPlay = false)
+            currentMainTab = 0
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.READ_MEDIA_AUDIO
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        permissionLauncher.launch(perm)
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            topBar = {
+                SaltTopBar(
+                    currentTab = currentMainTab,
+                    onTabChange = { currentMainTab = it },
+                    onPickFiles = { filePickerLauncher.launch(arrayOf("audio/*")) }
+                )
+            },
+            bottomBar = {
+                SaltBottomPlayerBar(
+                    controller = controller,
+                    onOpenFullPlayer = { showFullPlayer = true }
+                )
+            },
+            containerColor = MaterialTheme.colorScheme.background
+        ) { innerPadding ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+            ) {
+                if (currentMainTab == 0) {
+                    MultiQueuesView(
+                        controller = controller,
+                        onGoToFolders = { currentMainTab = 1 },
+                        onPickFiles = { filePickerLauncher.launch(arrayOf("audio/*")) }
+                    )
+                } else {
+                    LocalFoldersSourceView(
+                        folderGroups = folderGroups,
+                        onRefresh = { folderGroups = LocalAudioScanner.scanAudioByFolders(context) },
+                        onGenerateQueue = { folderName, tracks ->
+                            controller.createPlaylistFromFiles(folderName, tracks, autoPlay = false)
+                            currentMainTab = 0
+                        }
+                    )
+                }
+            }
+        }
+
+        // 全屏专辑封面与滚动歌词播放页
+        AnimatedVisibility(
+            visible = showFullPlayer,
+            enter = slideInVertically(initialOffsetY = { it }),
+            exit = slideOutVertically(targetOffsetY = { it })
+        ) {
+            FullScreenPlayerSheet(
+                controller = controller,
+                onDismiss = { showFullPlayer = false }
+            )
+        }
+    }
+}
+
+@Composable
+fun SaltTopBar(
+    currentTab: Int,
+    onTabChange: (Int) -> Unit,
+    onPickFiles: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "SaltLite 椒盐多队列",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+            FilledTonalButton(
+                onClick = onPickFiles,
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("选文件生成列表", fontSize = 13.sp)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .padding(4.dp)
+        ) {
+            val tabs = listOf("多播放列表 (自由切换)", "本地文件/目录库")
+            tabs.forEachIndexed { index, title ->
+                val selected = currentTab == index
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (selected) MaterialTheme.colorScheme.primary else Color.Transparent)
+                        .clickable { onTabChange(index) }
+                        .padding(vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = title,
+                        fontSize = 13.sp,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                        color = if (selected) Color.Black else Color.LightGray
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MultiQueuesView(
+    controller: SaltMultiQueueController,
+    onGoToFolders: () -> Unit,
+    onPickFiles: () -> Unit
+) {
+    val queues = controller.queues
+    val viewingId = controller.viewingQueueId
+    val playingId = controller.playingQueueId
+    val currentQueue = queues.find { it.id == viewingId } ?: queues.firstOrNull()
+
+    if (queues.isEmpty()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.QueueMusic,
+                contentDescription = null,
+                modifier = Modifier.size(64.dp),
+                tint = Color.Gray
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("当前还没有生成任何播放列表", color = Color.LightGray, fontSize = 16.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                "点击不同文件夹或选择音频文件，即可生成多个互不干扰的独立播放列表",
+                color = Color.Gray,
+                fontSize = 13.sp,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(onClick = onGoToFolders) {
+                    Text("从本地目录生成")
+                }
+                OutlinedButton(onClick = onPickFiles) {
+                    Text("自由选择音频文件")
+                }
+            }
+        }
+        return
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        LazyRow(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(queues, key = { it.id }) { session ->
+                val isViewing = session.id == currentQueue?.id
+                val isPlayingQueue = session.id == playingId
+
+                FilterChip(
+                    selected = isViewing,
+                    onClick = { controller.switchViewingQueue(session.id) },
+                    label = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (isPlayingQueue) {
+                                Icon(
+                                    imageVector = Icons.Default.GraphicEq,
+                                    contentDescription = "正在播放该列表",
+                                    modifier = Modifier.size(16.dp),
+                                    tint = if (isViewing) Color.Black else MaterialTheme.colorScheme.primary
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                            }
+                            Text(
+                                text = "${session.name} (${session.songs.size})",
+                                fontWeight = if (isViewing) FontWeight.Bold else FontWeight.Normal
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "关闭列表",
+                                modifier = Modifier
+                                    .size(15.dp)
+                                    .clickable { controller.closeQueueTab(session.id) }
+                            )
+                        }
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = MaterialTheme.colorScheme.primary,
+                        selectedLabelColor = Color.Black
+                    )
+                )
+            }
+        }
+
+        HorizontalDivider(color = Color(0xFF2A2D36))
+
+        if (currentQueue != null) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                itemsIndexed(
+                    items = currentQueue.songs,
+                    key = { _, song -> song.queueEntryId }
+                ) { index, song ->
+                    val isThisSongPlaying =
+                        (currentQueue.id == playingId) && (controller.currentSong?.queueEntryId == song.queueEntryId)
+
+                    PlaylistSongRow(
+                        index = index + 1,
+                        song = song,
+                        isPlaying = isThisSongPlaying,
+                        onSongClick = {
+                            controller.playSongInQueue(currentQueue.id, index)
+                        },
+                        onPlayNext = {
+                            controller.playNext(song, currentQueue.id)
+                        },
+                        onRemove = {
+                            controller.removeSongFromQueue(currentQueue.id, index)
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PlaylistSongRow(
+    index: Int,
+    song: SongTrack,
+    isPlaying: Boolean,
+    onSongClick: () -> Unit,
+    onPlayNext: () -> Unit,
+    onRemove: () -> Unit
+) {
+    var menuExpanded by remember { mutableStateOf(false) }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(
+                if (isPlaying) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+            )
+            .clickable { onSongClick() }
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(modifier = Modifier.width(32.dp), contentAlignment = Alignment.CenterStart) {
+            if (isPlaying) {
+                Icon(
+                    imageVector = Icons.Default.VolumeUp,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+            } else {
+                Text(
+                    text = index.toString(),
+                    color = Color.Gray,
+                    fontSize = 14.sp
+                )
+            }
+        }
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = song.title,
+                color = if (isPlaying) MaterialTheme.colorScheme.primary else Color.White,
+                fontSize = 15.sp,
+                fontWeight = if (isPlaying) FontWeight.Bold else FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = "${song.artist} · ${song.folderName}",
+                color = Color.Gray,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        // 右侧三个点菜单：下一首播放 + 从列表中移除
+        Box {
+            IconButton(onClick = { menuExpanded = true }) {
+                Icon(
+                    imageVector = Icons.Default.MoreVert,
+                    contentDescription = "更多操作",
+                    tint = Color.LightGray
+                )
+            }
+
+            DropdownMenu(
+                expanded = menuExpanded,
+                onDismissRequest = { menuExpanded = false }
+            ) {
+                DropdownMenuItem(
+                    leadingIcon = {
+                        Icon(Icons.Default.PlaylistPlay, contentDescription = null)
+                    },
+                    text = { Text("下一首播放") },
+                    onClick = {
+                        menuExpanded = false
+                        onPlayNext()
+                    }
+                )
+                DropdownMenuItem(
+                    leadingIcon = {
+                        Icon(Icons.Default.DeleteOutline, contentDescription = null, tint = Color(0xFFFF6B6B))
+                    },
+                    text = { Text("从列表中移除", color = Color(0xFFFF6B6B)) },
+                    onClick = {
+                        menuExpanded = false
+                        onRemove()
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun LocalFoldersSourceView(
+    folderGroups: Map<String, List<SongTrack>>,
+    onRefresh: () -> Unit,
+    onGenerateQueue: (String, List<SongTrack>) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "点击任意目录即可生成独立播放列表",
+                color = Color.LightGray,
+                fontSize = 14.sp
+            )
+            TextButton(onClick = onRefresh) {
+                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("重新扫描")
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        if (folderGroups.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    text = "未扫描到本地音乐文件，可点击右上角「选文件生成列表」",
+                    color = Color.Gray,
+                    fontSize = 14.sp
+                )
+            }
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(folderGroups.entries.toList(), key = { it.key }) { (folderName, tracks) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                            .clickable { onGenerateQueue(folderName, tracks) }
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Folder,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(36.dp)
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = folderName,
+                                    color = Color.White,
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "共 ${tracks.size} 首音频",
+                                    color = Color.Gray,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+
+                        Button(
+                            onClick = { onGenerateQueue(folderName, tracks) },
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                        ) {
+                            Icon(Icons.Default.PlaylistAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("生成列表", fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== 7. 底部迷你播放控制栏（含播放模式切换 + 点击展开全屏） ====================
+
+@Composable
+fun SaltBottomPlayerBar(
+    controller: SaltMultiQueueController,
+    onOpenFullPlayer: () -> Unit
+) {
+    val currentSong = controller.currentSong
+    val activeQueueName = controller.queues.find { it.id == controller.playingQueueId }?.name ?: "未在播放"
+
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 8.dp,
+        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onOpenFullPlayer() }
+                .padding(horizontal = 14.dp, vertical = 10.dp)
+        ) {
+            if (currentSong != null && controller.duration > 0L) {
+                Slider(
+                    value = controller.currentPosition.toFloat(),
+                    valueRange = 0f..controller.duration.toFloat().coerceAtLeast(1f),
+                    onValueChange = { controller.player?.seekTo(it.toLong()) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(18.dp)
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                // 左侧曲目信息（点击展开全屏封面与歌词页）
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { onOpenFullPlayer() }
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.surfaceVariant),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Album,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = currentSong?.title ?: "暂未播放歌曲 (点击展开歌词页)",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = if (currentSong != null) "${currentSong.artist} · [$activeQueueName]" else "点击任意列表中的歌曲开始播放",
+                            color = Color.Gray,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                // 右侧：播放模式切换 / 上一首 / 播放暂停 / 下一首
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { controller.togglePlayMode() }) {
+                        Icon(
+                            imageVector = controller.playMode.icon,
+                            contentDescription = controller.playMode.label,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    IconButton(onClick = { controller.player?.seekToPreviousMediaItem() }) {
+                        Icon(Icons.Default.SkipPrevious, contentDescription = "上一首", tint = Color.White)
+                    }
+                    FilledIconButton(
+                        onClick = {
+                            val p = controller.player ?: return@FilledIconButton
+                            if (p.isPlaying) p.pause() else p.play()
+                        }
+                    ) {
+                        Icon(
+                            imageVector = if (controller.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = "播放/暂停",
+                            tint = Color.Black
+                        )
+                    }
+                    IconButton(onClick = { controller.player?.seekToNextMediaItem() }) {
+                        Icon(Icons.Default.SkipNext, contentDescription = "下一首", tint = Color.White)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== 8. 全屏播放页（专辑封面 + LRC 歌词解析滚动 + 模式切换） ====================
+
+@Composable
+fun FullScreenPlayerSheet(
+    controller: SaltMultiQueueController,
+    onDismiss: () -> Unit
+) {
+    BackHandler(onBack = onDismiss)
+
+    val context = LocalContext.current
+    val currentSong = controller.currentSong
+    val activeQueueName = controller.queues.find { it.id == controller.playingQueueId }?.name ?: "当前无队列"
+
+    var albumBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var lrcLines by remember { mutableStateOf<List<LrcLine>>(emptyList()) }
+    var lyricsOnlyMode by remember { mutableStateOf(false) } // false: 封面+歌词同屏, true: 纯享大歌词
+
+    // 手动选择本地 .lrc 歌词文件导入器
+    val lrcPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null && currentSong != null) {
+            val parsed = MediaExtraHelper.loadLrcFromUri(context, uri)
+            if (parsed.isNotEmpty()) {
+                controller.manualLyricsMap[currentSong.title] = parsed
+                lrcLines = parsed
+                Toast.makeText(context, "成功导入 ${parsed.size} 行歌词", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(context, "未解析到有效的时间轴歌词", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    // 切歌时自动提取内嵌专辑封面 & 自动查找同名 LRC 歌词
+    LaunchedEffect(currentSong?.queueEntryId) {
+        if (currentSong == null) {
+            albumBitmap = null
+            lrcLines = emptyList()
+            return@LaunchedEffect
+        }
+        withContext(Dispatchers.IO) {
+            albumBitmap = MediaExtraHelper.extractEmbeddedAlbumArt(context, currentSong.uri)
+            val cachedManual = controller.manualLyricsMap[currentSong.title]
+            lrcLines = if (!cachedManual.isNullOrEmpty()) {
+                cachedManual
+            } else {
+                MediaExtraHelper.loadAutoLrcForSong(currentSong)
+            }
+        }
+    }
+
+    // 计算当前播放时间对应的高亮歌词行下标
+    val activeLineIndex = remember(controller.currentPosition, lrcLines) {
+        if (lrcLines.isEmpty()) -1
+        else lrcLines.indexOfLast { it.timeMs <= controller.currentPosition }.coerceAtLeast(0)
+    }
+
+    val lyricsListState = rememberLazyListState()
+
+    // 歌词随播放进度自动平滑居中滚动
+    LaunchedEffect(activeLineIndex) {
+        if (activeLineIndex >= 0 && lrcLines.isNotEmpty()) {
+            val targetScrollIndex = (activeLineIndex - 2).coerceAtLeast(0)
+            lyricsListState.animateScrollToItem(targetScrollIndex)
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(Color(0xFF1F2633), Color(0xFF0E1015))
+                )
+            )
+            .padding(horizontal = 20.dp, vertical = 16.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            // 顶部栏：收起按钮 / 正在播放队列名 / 视图切换与导入歌词
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onDismiss) {
+                    Icon(
+                        imageVector = Icons.Default.KeyboardArrowDown,
+                        contentDescription = "收起全屏播放页",
+                        tint = Color.White,
+                        modifier = Modifier.size(30.dp)
+                    )
+                }
+
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = activeQueueName,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = if (lyricsOnlyMode) "纯享歌词视图" else "封面与歌词同屏",
+                        color = Color.Gray,
+                        fontSize = 11.sp
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(
+                        onClick = { lrcPickerLauncher.launch(arrayOf("*/*")) },
+                        contentPadding = PaddingValues(horizontal = 8.dp)
+                    ) {
+                        Icon(Icons.Default.Subtitles, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("导入LRC", fontSize = 12.sp)
+                    }
+                    IconButton(onClick = { lyricsOnlyMode = !lyricsOnlyMode }) {
+                        Icon(
+                            imageVector = if (lyricsOnlyMode) Icons.Default.Album else Icons.Default.Lyrics,
+                            contentDescription = "切换封面/歌词布局",
+                            tint = Color.White
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // 专辑封面区域（可点击切换纯享大歌词视图）
+            if (!lyricsOnlyMode) {
+                Box(
+                    modifier = Modifier
+                        .size(210.dp)
+                        .clip(RoundedCornerShape(24.dp))
+                        .background(Color(0xFF262B36))
+                        .clickable { lyricsOnlyMode = true },
+                    contentAlignment = Alignment.Center
+                ) {
+                    val bmp = albumBitmap
+                    if (bmp != null) {
+                        Image(
+                            bitmap = bmp.asImageBitmap(),
+                            contentDescription = "专辑封面",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                imageVector = Icons.Default.Album,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(84.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text("点击封面可展开全屏大歌词", color = Color.Gray, fontSize = 11.sp)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+            }
+
+            // 歌曲标题与艺术家
+            Text(
+                text = currentSong?.title ?: "暂未播放歌曲",
+                color = Color.White,
+                fontSize = 21.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = currentSong?.artist ?: "未知艺术家",
+                color = Color.LightGray,
+                fontSize = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // LRC 滚动歌词区域（支持点击任意歌词行直接跳转播放进度）
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color.Black.copy(alpha = 0.22f))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                if (lrcLines.isEmpty()) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            text = "暂无匹配的同名 LRC 歌词",
+                            color = Color.Gray,
+                            fontSize = 14.sp
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { lrcPickerLauncher.launch(arrayOf("*/*")) }
+                        ) {
+                            Icon(Icons.Default.FileOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("手动选择本地 .lrc 歌词文件", fontSize = 13.sp)
+                        }
+                    }
+                } else {
+                    LazyColumn(
+                        state = lyricsListState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(vertical = 48.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        itemsIndexed(lrcLines) { index, line ->
+                            val isCurrentLine = index == activeLineIndex
+                            Text(
+                                text = line.text,
+                                color = if (isCurrentLine) MaterialTheme.colorScheme.primary else Color.Gray,
+                                fontSize = if (isCurrentLine) 18.sp else 14.sp,
+                                fontWeight = if (isCurrentLine) FontWeight.Bold else FontWeight.Normal,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        controller.player?.seekTo(line.timeMs)
+                                        controller.currentPosition = line.timeMs
+                                    }
+                                    .padding(vertical = 6.dp, horizontal = 8.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // 播放进度条与时间刻度
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Slider(
+                    value = controller.currentPosition.toFloat(),
+                    valueRange = 0f..controller.duration.toFloat().coerceAtLeast(1f),
+                    onValueChange = {
+                        controller.player?.seekTo(it.toLong())
+                        controller.currentPosition = it.toLong()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = MediaExtraHelper.formatTime(controller.currentPosition),
+                        color = Color.Gray,
+                        fontSize = 12.sp
+                    )
+                    Text(
+                        text = MediaExtraHelper.formatTime(controller.duration),
+                        color = Color.Gray,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // 底部控制按钮栏：播放模式切换 / 上一首 / 播放暂停 / 下一首 / 切回歌词或封面
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // 播放模式切换按钮（带文字提示）
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { controller.togglePlayMode() }
+                        .padding(6.dp)
+                ) {
+                    Icon(
+                        imageVector = controller.playMode.icon,
+                        contentDescription = controller.playMode.label,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(26.dp)
+                    )
+                    Text(
+                        text = controller.playMode.label,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontSize = 10.sp
+                    )
+                }
+
+                IconButton(
+                    onClick = { controller.player?.seekToPreviousMediaItem() },
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.SkipPrevious,
+                        contentDescription = "上一首",
+                        tint = Color.White,
+                        modifier = Modifier.size(34.dp)
+                    )
+                }
+
+                FilledIconButton(
+                    onClick = {
+                        val p = controller.player ?: return@FilledIconButton
+                        if (p.isPlaying) p.pause() else p.play()
+                    },
+                    modifier = Modifier.size(64.dp)
+                ) {
+                    Icon(
+                        imageVector = if (controller.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                        contentDescription = "播放/暂停",
+                        tint = Color.Black,
+                        modifier = Modifier.size(36.dp)
+                    )
+                }
+
+                IconButton(
+                    onClick = { controller.player?.seekToNextMediaItem() },
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.SkipNext,
+                        contentDescription = "下一首",
+                        tint = Color.White,
+                        modifier = Modifier.size(34.dp)
+                    )
+                }
+
+                // 快捷收起按钮
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { onDismiss() }
+                        .padding(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.QueueMusic,
+                        contentDescription = "返回多列表",
+                        tint = Color.LightGray,
+                        modifier = Modifier.size(26.dp)
+                    )
+                    Text(
+                        text = "多列表",
+                        color = Color.LightGray,
+                        fontSize = 10.sp
+                    )
+                }
+            }
+        }
+    }
+}
